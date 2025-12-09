@@ -1,0 +1,85 @@
+name: CI – Sync Autodesk Outpost Image to GitHub Container Registry
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      packages: write   # Required to push to GHCR
+
+    env:
+      UPSTREAM_IMAGE: autodesk/tandem-connect-outpost
+      GHCR_REPO: tandem-connect-outpost
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) Detect latest tag
+      - name: Get latest tag
+        id: tag
+        run: |
+          TAG=$(curl -s "https://hub.docker.com/v2/repositories/${UPSTREAM_IMAGE}/tags?page_size=1&page=1&ordering=last_updated" | jq -r '.results[0].name')
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      # 2) Detect digest of that tag
+      - name: Get digest
+        id: hub
+        run: |
+          DIGEST=$(curl -s "https://hub.docker.com/v2/repositories/${UPSTREAM_IMAGE}/tags/${{ steps.tag.outputs.tag }}" | jq -r '.images[0].digest')
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+      # 3) Detect last deployed digest
+      - name: Load previous digest
+        id: last
+        run: |
+          if [ -f .last_digest ]; then
+            echo "last=$(cat .last_digest)" >> $GITHUB_OUTPUT
+          else
+            echo "last=none" >> $GITHUB_OUTPUT
+          fi
+
+      # 4) Stop if no new image
+      - name: Stop if unchanged
+        if: steps.hub.outputs.digest == steps.last.outputs.last
+        run: echo "⏭ No new version — stopping job" && exit 0
+
+      # 5) Login to GHCR
+      - name: Docker Login to GHCR
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # 6) Pull from Docker Hub and Push to GHCR
+        # DockerHub → GHCR mirror for POC
+      - name: Mirror image to GHCR
+        run: |
+          docker pull docker.io/${UPSTREAM_IMAGE}:${{ steps.tag.outputs.tag }}
+          docker tag docker.io/${UPSTREAM_IMAGE}:${{ steps.tag.outputs.tag }} \
+            ghcr.io/${{ github.repository_owner }}/${GHCR_REPO}:${{ steps.tag.outputs.tag }}
+          docker push ghcr.io/${{ github.repository_owner }}/${GHCR_REPO}:${{ steps.tag.outputs.tag }}
+
+      # 7) Save digest + version metadata
+      - name: Save digest + metadata
+        run: |
+          echo "${{ steps.hub.outputs.digest }}" > .last_digest
+          echo "${{ steps.tag.outputs.tag }}" > new_tag.txt
+          echo "ghcr.io/${{ github.repository_owner }}/${GHCR_REPO}:${{ steps.tag.outputs.tag }}" > image_uri.txt
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add .last_digest
+          git commit -m "Update last digest [skip ci]" || true
+          git push
+
+      # 8) Save artifact for CD
+      - name: Upload artifact for CD
+        uses: actions/upload-artifact@v4
+        with:
+          name: outpost-image-info
+          path: |
+            new_tag.txt
+            image_uri.txt
